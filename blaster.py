@@ -13,31 +13,35 @@ def switchy_main(net):
     myips = [intf.ipaddr for intf in my_intf]
 
     #parse blaster_params.txt file to determine blaster behavior; assume file structure and location
+    log_debug("Reading file.")
     file = open("blaster_params.txt", "r")
-    firstLine = f.readline()
+    firstLine = file.readline()
     splitLine = firstLine.split()  #default is whitespace
     
     #parse out lines in the file #TODO - do I need to validate these
+    log_debug("Parsing file.")
     if splitLine[0] == "-b": blastee_IP = splitLine[1]
-    if splitLine[2] == "-n": num = splitLine[3]
-    if splitLine[4] == "-l": length = splitLine[5]
-    if splitLine[6] == "-w": sender_window = splitLine[7]
-    if splitLine[8] == "-rtt": RTT = splitLine[9]
-    if splitLine[10] == "-r": recv_timeout = splitLine[11]
-    if splitLine[12] == "-alpha": alpha = splitLine[13]
-    
-    #initialize estRTT and t_out with values from file
+    if splitLine[2] == "-n": total_to_send = int(splitLine[3])
+    if splitLine[4] == "-l": length = int(splitLine[5])
+    if splitLine[6] == "-w": sender_window = int(splitLine[7])
+    if splitLine[8] == "-rtt": RTT = float(splitLine[9]) #TODO+1 cast correctly?
+    if splitLine[10] == "-r": recv_timeout = float(splitLine[11]) 
+    if splitLine[12] == "-alpha": alpha = float(splitLine[13])
+    log_debug("Parse check: {} is alpha.".format(alpha))
+
+    #initialize variables from file, sent packet count, and sending window table
     estRTT = RTT
     t_out = 2 * estRTT
-
-    #initialize sender window table for tracking SW and unACKd packets
-    swTable = SendingWindowTable
+    sent_count = 0    
+    goodput_Bytes = 0
+    
+    swTable = SendingWindowTable(sender_window)
     
     #stay in loop while blaster agent is running    
     while True:
         gotpkt = True
         try:
-            timestamp,dev,pkt = net.recv_packet(timeout=recv_timeout)  #TODO changed timeout here to value from file, OK?
+            timestamp,dev,pkt = net.recv_packet(timeout=recv_timeout)
         except NoPackets:
             log_debug("No packets available in recv_packet")
             gotpkt = False
@@ -46,7 +50,7 @@ def switchy_main(net):
             break
 
         if gotpkt:
-            log_debug("I got a packet")
+            log_debug("Packet received.")
             
             #TODO receive and parse an ACK package (check seq number? check first 8 bytes?)
             packet_sequence_number = 1 #TODO set to actual value
@@ -55,7 +59,8 @@ def switchy_main(net):
             if swTable.packetEntryIndexNumber(packet_sequence_number) == -1: continue
             
             #ACK for unACKed packet - retrieve the RTT for the packet and then remove from the table
-            packet_rtt = time.perf_counter() - swTable.sentTimeForPacket(packet_sequence_number)
+            ackTime - time.pref_counter()
+            packet_rtt = ackTime - swTable.sentTimeForPacket(packet_sequence_number)
             swTable.removeFromPacketList(packet, packet_sequence_number)
                 
             #ACK for unACKed packet - do estRTT and timeout calculations
@@ -65,67 +70,86 @@ def switchy_main(net):
             if (rtt > max_rtt) or (max_rtt is None): max_rtt = rtt
                         
             #if final ACK - do final calculations and print out stats to screen
-            total_time = time.perf_counter() - first_packet_start_time
-            throughput = (goodput_Bytes + reTx_Bytes) / total_time
-            goodput = goodput_Bytes / total_time
-            print_output(total_time, num_ret, num_tos, throughput, goodput, estRTT, t_out, min_rtt, max_rtt)
-            
+            if swTable.LHS == total_count:
+                total_time = ackTime - first_packet_start_time
+                throughput = (goodput_Bytes + reTx_Bytes) / total_time
+                goodput = goodput_Bytes / total_time
+                print_output(total_time, num_ret, num_tos, throughput, goodput, estRTT, t_out, min_rtt, max_rtt)
+                break #all done!
             
         else:
-            log_debug("Didn't receive anything")
+            log_debug("Didn't receive a packet.")
             
             #TODO - this is a coarse timeout? not sure! Maybe only count if first_packet_start_time is not None?
             #num_tos += 1
             
             log_debug("Check if sending window allows sending another packet.")
-            #check SW C1: RHS - LHS <= SW to  and determine if a packet can be sent now
-            if swTable.canSendAnotherPacket == TRUE: 
+            if swTable.canSendAnotherPacket() == True: 
+                
+                if sent_count < total_to_send:
+                    log_debug("Sending a new packet.")
+                
+                    #track statistics
+                    if sent_count == 0: first_packet_start_time = time.perf_counter() #for first packet
+                    goodput_Bytes += length
 
-                #TODO this means we can send a new packet!
-                #check if we have more new packets to send
-                #send new packet
+                    #create and send packet
+                    sent_count += 1
+                    log_debug("Creating and sending new packet.")
+                    packet = create_packet(blastee_IP, length, sent_count)
+                    log_debug("Packet created: {}".format(packet))
+                    net.send_packet('middlebox', packet) #TODO middlebox or blastee? if port, should be middlebox I think.
 
-                #if this is the first packet sent, start tx counter
-                if first_packet_start_time is None: first_packet_start_time = time.perf_counter()
+                    #add to unACKd packets table which also increments RHS. sent_count is seq number.
+                    swTable.addToPacketList(packet, sent_count)
 
-                #if this is a first transmission of this packet
-                #track number of bytes being sent:
-                #goodput_Bytes is size of packet
+                    #try to receive again
+                    continue
 
-                #add to unACKd packets table which also increments RHS
-                swTable.addToPacketList(pkt, pkt_sequence_number)
+                else:
+                    log_debug("Packet can be sent based on Sending Window, but no new packets to send.")
 
-                #then continue.
-
-            log_debug("Cannot send new packet, or done sending new packets. Check if we can retransmit.")
-
+            log_debug("Check unACKd packets to see if any timed out.")
             packetToRetransmitIndex = swTable.timedOutPacketIndex
             if packetToRetransmitIndex >=0:
 
                 log_debug("We have a timed out packet. Attempt retransmit.")
-                #increment count by one
-                #num_ret += 1
-                #reTx_Bytes  #TODO I should have a method to retrieve bytes from a packet
+                
+                #track retransmit statistics
+                num_ret += 1
+                reTx_Bytes += length
 
-                #do I need to build anything? or just grab packet from tablet and resubmit? Simple enough.
-                packetToRetransmit = swTable.sent_packets_list(index).packet  #TODO need getter?
+                #retrieve and resend packet
+                log_debug("Retrieving and sending unACKd packet.")
+                packetToRetransmit = swTable.sent_packets_list[index].packet  #TODO need getter?
+                net.send_packet('middlebox', packet) #TODO middlebox or blastee? if port, should be middlebox I think.
 
+                #try to receive again
+                continue
 
-            '''
-            Creating the headers for the packet
-            '''
-            #TODO - do I need addresses?
-            pkt = Ethernet() + IPv4() + UDP()
-            pkt[1].protocol = IPProtocol.UDP
-            
-            #append sequence number (32 bits), length (16 bits), and payload (variable length)
-
-            
-            '''
-            Do other things here and send packet
-            '''
 
     net.shutdown()
+
+#create_packet will create packet for sending
+def create_packet(blastee_IP, length, sent_count):
+    
+    pkt = Ethernet() + IPv4() + UDP()  #TODO add call to Packet base class?
+    pkt[0].src = "10:00:00:00:00:01" #Ethernet - blaster source and middlebox dst
+    pkt[0].dst = "40:00:00:00:00:01"
+    pkt[1].protocol = IPProtocol.UDP  #IP - protocol, blaster source and middlebox dst
+    pkt[1].src = '192.168.100.100' #This could be wrong.
+    pkt[1].dst = blastee_IP
+    pkt[2].src = 4444  #UDP - arbitrary values, not used
+    pkt[2].dst = 5555
+
+    #encode sequence number - 4 bytes (32 bit), lenght - 2 bytes (16 bit)
+    pkt += RawPacketContents(sent_count.to_bytes(4, byteorder='big'))
+    pkt += RawPacketContents(length.to_bytes(2, byteorder='big'))
+
+    #encode variable length payload
+    pkt += RawPacketContents(length.to_bytes(length, byteorder ='big'))
+
+    return pkt
 
 #print_output prints transmission statistics
 def print_output(total_time, num_ret, num_tos, throughput, goodput, estRTT, t_out, min_rtt, max_rtt):
@@ -151,11 +175,11 @@ class sentPacketEntry:
 
 #SendingWindowTable will track unACKd packets and provide sending window calculations
 class SendingWindowTable:
-    def __init__(self,sending_window):
-        self.sent_packets_list = list
-        SW = sending_window  #count
-        LHS = 1
-        RHS = 1
+    def __init__(self,sender_window):
+        self.sent_packets_list = list()
+        self.SW = sender_window  #count
+        self.LHS = 1
+        self.RHS = 1
 
     #called after packet is sent - will add packet if necessary (first time) and time stamp
     #TODO do I need both packet and sequence number? Or pull out sequence number from packet?
@@ -164,7 +188,7 @@ class SendingWindowTable:
         #if packet isn't already in table, create sentPacket object, add to table with time, increment RHS
         if self.packetEntryIndexNumber(packet_sequence_number) == -1:
             self.sent_packets_list.append(sentPacketEntry(packet, packet_sequence_number))
-            RHS += 1
+            self.RHS += 1
            
     #removeFromPacketList when we receive an ACK - remove from table and update LHS
     #TODO do I need both packet and sequence number? Or pull out sequence number from packet?
@@ -174,15 +198,15 @@ class SendingWindowTable:
         #if packet is in table, remove it and update LHS
         index = self.packetEntryIndexNumber(packet_sequence_number)
         if index >= 0:
-             self.sent_packets_list.remove(index)
-             self.recalculateLHS(self)
+             self.sent_packets_list.pop(index)
+             self.recalculateLHS()
 
     #packetEntryIndexNumber returns -1 if packet is not in table, otherwise returns index position
     def packetEntryIndexNumber(self, packet_sequence_number):
 
-        for packetEntry in sent_packets_list:
+        for packetEntry in self.sent_packets_list:
             if packetEntry.packet_sequence_number == packet_sequence_number:
-                return sent_packets_list.index(packetEntry)
+                return self.sent_packets_list.index(packetEntry)
         
         return -1
 
@@ -191,33 +215,37 @@ class SendingWindowTable:
         
         #find packet in table, then find time sent
         index = self.packetEntryIndexNumber(packet_sequence_number)
-        return sent_packets_list(index).time_sent()  #TODO need getter?
+        return self.sent_packets_list[index].time_sent
              
     #canSend checks if sending window and current in flight un'ACKd packets allow for sending
     def canSendAnotherPacket(self):
-        if (RHS - LHS) < SW: return True
+        
+        log_debug("Checking sending window. SW = {}, LHS = {}, RHS = {}".format(self.SW, self.LHS, self.RHS))
+        if (self.RHS - self.LHS) < self.SW: 
+            log_debug("Yes, can send another packet.")
+            return True
         else: return False
         
     def recalculateLHS(self):
 
         #set up initial value
-        lowest_sequence_number = 0
+        lowest_sequence_number = self.RHS
 
         #check each packet in table to find lowest sequence number
-        for packetEntry in sent_packets_list:
+        for packetEntry in self.sent_packets_list:
             table_sequence_number = packetEntry.packet_sequence_number
             if (table_sequence_number < lowest_sequence_number) or (lowest_sequence_number == 0):
                 lowest_sequence_number = table_sequence_number
         
         #update LHS based on lowest value from table
-        LHS = lowest_sequence_number    
+        self.LHS = lowest_sequence_number    
 
     #timedOutPacketIndex identifies the first packet in table that has timed out
     def timedOutPacketIndex(self, timeout):
 
         current_time = time.perf_counter()
-        for packetEntry in sent_packets_list:
-            if current_time > packetEntry.time_sent:
-                return sent_packets_list.index(packetEntry)
+        for packetEntry in self.sent_packets_list:
+            if current_time > (packetEntry.time_sent + + float(timeout)):
+                return self.sent_packets_list.index(packetEntry)
         
         return -1
