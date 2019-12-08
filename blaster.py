@@ -12,6 +12,8 @@ def switchy_main(net):
     mymacs = [intf.ethaddr for intf in my_intf]
     myips = [intf.ipaddr for intf in my_intf]
 
+    print(my_intf)
+
     #parse blaster_params.txt file to determine blaster behavior; assume file structure and location
     log_debug("Reading file.")
     file = open("blaster_params.txt", "r")
@@ -25,7 +27,7 @@ def switchy_main(net):
     if splitLine[4] == "-l": length = int(splitLine[5])
     if splitLine[6] == "-w": sender_window = int(splitLine[7])
     if splitLine[8] == "-rtt": RTT = float(splitLine[9]) #TODO+1 cast correctly?
-    if splitLine[10] == "-r": recv_timeout = float(splitLine[11]) 
+    if splitLine[10] == "-r": recv_timeout = float(splitLine[11])
     if splitLine[12] == "-alpha": alpha = float(splitLine[13])
     log_debug("Parse check: {} is alpha.".format(alpha))
 
@@ -34,14 +36,17 @@ def switchy_main(net):
     t_out = 2 * estRTT
     sent_count = 0    
     goodput_Bytes = 0
-    
+    num_ret = 0
+    reTx_Bytes = 0
+
     swTable = SendingWindowTable(sender_window)
     
     #stay in loop while blaster agent is running    
     while True:
         gotpkt = True
         try:
-            timestamp,dev,pkt = net.recv_packet(timeout=recv_timeout)
+            log_debug("Attempting to receive packet")
+            timestamp,dev,pkt = net.recv_packet(timeout=(recv_timeout/1000))  #TODO use timestamp, instead of perf_counter, further down?
         except NoPackets:
             log_debug("No packets available in recv_packet")
             gotpkt = False
@@ -53,7 +58,7 @@ def switchy_main(net):
             log_debug("Packet received.")
             
             #TODO receive and parse an ACK package (check seq number? check first 8 bytes?)
-            packet_sequence_number = 1 #TODO set to actual value
+            packet_sequence_number = 1
             
             #if we already ACK this packet, ignore this packet and continue
             if swTable.packetEntryIndexNumber(packet_sequence_number) == -1: continue
@@ -80,9 +85,6 @@ def switchy_main(net):
         else:
             log_debug("Didn't receive a packet.")
             
-            #TODO - this is a coarse timeout? not sure! Maybe only count if first_packet_start_time is not None?
-            #num_tos += 1
-            
             log_debug("Check if sending window allows sending another packet.")
             if swTable.canSendAnotherPacket() == True: 
                 
@@ -98,7 +100,7 @@ def switchy_main(net):
                     log_debug("Creating and sending new packet.")
                     packet = create_packet(blastee_IP, length, sent_count)
                     log_debug("Packet created: {}".format(packet))
-                    net.send_packet('middlebox', packet) #TODO middlebox or blastee? if port, should be middlebox I think.
+                    net.send_packet(net.interface_by_name('blaster-eth0'), packet) #TODO middlebox or blastee? if port, should be middlebox I think.
 
                     #add to unACKd packets table which also increments RHS. sent_count is seq number.
                     swTable.addToPacketList(packet, sent_count)
@@ -110,7 +112,7 @@ def switchy_main(net):
                     log_debug("Packet can be sent based on Sending Window, but no new packets to send.")
 
             log_debug("Check unACKd packets to see if any timed out.")
-            packetToRetransmitIndex = swTable.timedOutPacketIndex
+            packetToRetransmitIndex = swTable.timedOutPacketIndex(t_out/1000) #t_out is in ms
             if packetToRetransmitIndex >=0:
 
                 log_debug("We have a timed out packet. Attempt retransmit.")
@@ -118,11 +120,13 @@ def switchy_main(net):
                 #track retransmit statistics
                 num_ret += 1
                 reTx_Bytes += length
+                #TODO - this is a coarse timeout? not sure! Maybe only count if first_packet_start_time is not None?
+                #num_tos += 1
 
                 #retrieve and resend packet
                 log_debug("Retrieving and sending unACKd packet.")
-                packetToRetransmit = swTable.sent_packets_list[index].packet  #TODO need getter?
-                net.send_packet('middlebox', packet) #TODO middlebox or blastee? if port, should be middlebox I think.
+                packetToRetransmit = swTable.sent_packets_list[packetToRetransmitIndex].packet
+                net.send_packet(net.interface_by_name('blaster-eth0'), packetToRetransmit)
 
                 #try to receive again
                 continue
@@ -134,7 +138,7 @@ def switchy_main(net):
 def create_packet(blastee_IP, length, sent_count):
     
     pkt = Ethernet() + IPv4() + UDP()  #TODO add call to Packet base class?
-    pkt[0].src = "10:00:00:00:00:01" #Ethernet - blaster source and middlebox dst
+    pkt[0].src = "10:00:00:00:00:01" #Ethernet - blaster source and middlebox dst #TODO is this correct?
     pkt[0].dst = "40:00:00:00:00:01"
     pkt[1].protocol = IPProtocol.UDP  #IP - protocol, blaster source and middlebox dst
     pkt[1].src = '192.168.100.100' #This could be wrong.
