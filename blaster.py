@@ -31,14 +31,16 @@ def switchy_main(net):
     if splitLine[12] == "-alpha": alpha = float(splitLine[13])
     log_debug("Parse check: {} is alpha.".format(alpha))
 
-    #initialize variables from file, sent packet count, and sending window table
+    #initialize variables and sending window table
     estRTT = RTT
     t_out = 2 * estRTT
     sent_count = 0    
     goodput_Bytes = 0
     num_ret = 0
     reTx_Bytes = 0
-
+    num_tos = 0
+    min_rtt = None # -1 #initialize to 
+    max_rtt = None 
     swTable = SendingWindowTable(sender_window)
     
     #stay in loop while blaster agent is running    
@@ -46,7 +48,7 @@ def switchy_main(net):
         gotpkt = True
         try:
             log_debug("Attempting to receive packet")
-            timestamp,dev,pkt = net.recv_packet(timeout=(recv_timeout/1000))  #TODO use timestamp, instead of perf_counter, further down?
+            timestamp,dev,pkt = net.recv_packet(timeout=(recv_timeout/1000))
         except NoPackets:
             log_debug("No packets available in recv_packet")
             gotpkt = False
@@ -56,26 +58,30 @@ def switchy_main(net):
 
         if gotpkt:
             log_debug("Packet received.")
-            
-            #TODO receive and parse an ACK package (check seq number? check first 8 bytes?)
-            packet_sequence_number = 1
+
+            #test parsing packet. TODO clean up this chunk.
+            #log_debug("Number headers: {}".format(pkt.num_headers()))
+            #log_debug("Header 3 is : {}".format(papktcket[3]))
+            seq_num_bytes = pkt[3].to_bytes()[:4] #first 4 bytes is seq number
+            packet_sequence_number = int.from_bytes(seq_num_bytes, byteorder='big')
+            log_debug("ACK message seq num is {}".format(packet_sequence_number))
             
             #if we already ACK this packet, ignore this packet and continue
             if swTable.packetEntryIndexNumber(packet_sequence_number) == -1: continue
             
             #ACK for unACKed packet - retrieve the RTT for the packet and then remove from the table
-            ackTime - time.pref_counter()
+            ackTime = time.perf_counter() #TODO or use timestamp from receviing packet
             packet_rtt = ackTime - swTable.sentTimeForPacket(packet_sequence_number)
-            swTable.removeFromPacketList(packet, packet_sequence_number)
+            swTable.removeFromPacketList(pkt, packet_sequence_number)
                 
             #ACK for unACKed packet - do estRTT and timeout calculations
             estRTT = ((1-alpha)* estRTT) + (alpha * (packet_rtt))
             t_out = 2 * estRTT
-            if (rtt < min_rtt) or (min_rtt is None): min_rtt = rtt
-            if (rtt > max_rtt) or (max_rtt is None): max_rtt = rtt
+            if (min_rtt == None) or (packet_rtt < min_rtt): min_rtt = packet_rtt
+            if (max_rtt == None) or (packet_rtt > max_rtt): max_rtt = packet_rtt
                         
             #if final ACK - do final calculations and print out stats to screen
-            if swTable.LHS == total_count:
+            if swTable.LHS == total_to_send:
                 total_time = ackTime - first_packet_start_time
                 throughput = (goodput_Bytes + reTx_Bytes) / total_time
                 goodput = goodput_Bytes / total_time
@@ -83,9 +89,7 @@ def switchy_main(net):
                 break #all done!
             
         else:
-            log_debug("Didn't receive a packet.")
-            
-            log_debug("Check if sending window allows sending another packet.")
+            log_debug("Didn't receive a packet. Evaluate if blast has new packet to send.")
             if swTable.canSendAnotherPacket() == True: 
                 
                 if sent_count < total_to_send:
@@ -97,10 +101,9 @@ def switchy_main(net):
 
                     #create and send packet
                     sent_count += 1
-                    log_debug("Creating and sending new packet.")
                     packet = create_packet(blastee_IP, length, sent_count)
                     log_debug("Packet created: {}".format(packet))
-                    net.send_packet(net.interface_by_name('blaster-eth0'), packet) #TODO middlebox or blastee? if port, should be middlebox I think.
+                    net.send_packet(net.interface_by_name('blaster-eth0'), packet)
 
                     #add to unACKd packets table which also increments RHS. sent_count is seq number.
                     swTable.addToPacketList(packet, sent_count)
@@ -112,7 +115,7 @@ def switchy_main(net):
                     log_debug("Packet can be sent based on Sending Window, but no new packets to send.")
 
             log_debug("Check unACKd packets to see if any timed out.")
-            packetToRetransmitIndex = swTable.timedOutPacketIndex(t_out/1000) #t_out is in ms
+            packetToRetransmitIndex = swTable.timedOutPacketIndex(t_out/1000) #t_out from file is in ms
             if packetToRetransmitIndex >=0:
 
                 log_debug("We have a timed out packet. Attempt retransmit.")
@@ -137,20 +140,19 @@ def switchy_main(net):
 #create_packet will create packet for sending
 def create_packet(blastee_IP, length, sent_count):
     
-    pkt = Ethernet() + IPv4() + UDP()  #TODO add call to Packet base class?
-    pkt[0].src = "10:00:00:00:00:01" #Ethernet - blaster source and middlebox dst #TODO is this correct?
-    pkt[0].dst = "40:00:00:00:00:01"
-    pkt[1].protocol = IPProtocol.UDP  #IP - protocol, blaster source and middlebox dst
-    pkt[1].src = '192.168.100.100' #This could be wrong.
+    pkt = Ethernet() + IPv4() + UDP()
+    pkt[0].src = "10:00:00:00:00:01" #Ethernet - blaster source and blastee dst, based on start_mininet topography
+    pkt[0].dst = "20:00:00:00:00:01" #TODO Is this OK to do? with IP, I get that from the file, but not with Layer 2?
+    pkt[1].protocol = IPProtocol.UDP  #IP - protocol, blaster source and blastee dst
+    pkt[1].src = '192.168.100.1' #based on start_mininet topography
     pkt[1].dst = blastee_IP
     pkt[2].src = 4444  #UDP - arbitrary values, not used
     pkt[2].dst = 5555
 
-    #encode sequence number - 4 bytes (32 bit), lenght - 2 bytes (16 bit)
-    pkt += RawPacketContents(sent_count.to_bytes(4, byteorder='big'))
-    pkt += RawPacketContents(length.to_bytes(2, byteorder='big'))
+    #encode custom packet header - sequence number - 4 bytes (32 bit), length - 2 bytes (16 bit)
+    pkt += RawPacketContents(sent_count.to_bytes(4, byteorder='big') + length.to_bytes(2, byteorder='big'))
 
-    #encode variable length payload
+    #encode variable length payload - last portion of a packet is considered payload
     pkt += RawPacketContents(length.to_bytes(length, byteorder ='big'))
 
     return pkt
@@ -166,7 +168,6 @@ def print_output(total_time, num_ret, num_tos, throughput, goodput, estRTT, t_ou
     print("Final TO(ms): " + str(TO))
     print("Min RTT(ms):" + str(min_rtt))
     print("Max RTT(ms):" + str(max_rtt))
-        
         
 #sentPacketEntry objects will store info about packets that are in the sender window awaiting ACK
 #TODO Double check whether this is byte oriented.
